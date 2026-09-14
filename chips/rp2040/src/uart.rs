@@ -586,6 +586,11 @@ impl Uart<'_> {
         (m, self.rx_overruns.get())
     }
 
+    /// Diagnostics: whether the hardware FIFOs are enabled (UARTLCR_H.FEN).
+    pub fn fifo_enabled(&self) -> bool {
+        self.registers.uartlcr_h.is_set(UARTLCR_H::FEN)
+    }
+
     pub fn is_configured(&self) -> bool {
         self.registers.uartcr.is_set(UARTCR::UARTEN)
             && (self.registers.uartcr.is_set(UARTCR::RXE)
@@ -698,8 +703,9 @@ impl Configure for Uart<'_> {
         }
         self.registers.uartlcr_h.modify(UARTLCR_H::BRK::CLEAR);
 
-        // FIFO is not precise enough for receive
-        self.registers.uartlcr_h.modify(UARTLCR_H::FEN::CLEAR);
+        // Keep the FIFOs enabled (set above). The receive path drains the FIFO on the
+        // level and timeout interrupts, so short tails are delivered promptly.
+        self.registers.uartlcr_h.modify(UARTLCR_H::FEN::SET);
 
         // Enable uart and transmit
         self.registers
