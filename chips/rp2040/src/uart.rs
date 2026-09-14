@@ -391,6 +391,9 @@ pub struct Uart<'a> {
     tx_status: Cell<UARTStateTX>,
 
     rx_buffer: TakeCell<'static, [u8]>,
+    /// Diagnostics: max bytes drained by one interrupt (FIFO occupancy proxy) and overrun count.
+    rx_max_drain: Cell<u32>,
+    rx_overruns: Cell<u32>,
     rx_position: Cell<usize>,
     rx_len: Cell<usize>,
     rx_status: Cell<UARTStateRX>,
@@ -413,6 +416,8 @@ impl<'a> Uart<'a> {
             tx_status: Cell::new(UARTStateTX::Idle),
 
             rx_buffer: TakeCell::empty(),
+            rx_max_drain: Cell::new(0),
+            rx_overruns: Cell::new(0),
             rx_position: Cell::new(0),
             rx_len: Cell::new(0),
             rx_status: Cell::new(UARTStateRX::Idle),
@@ -433,6 +438,8 @@ impl<'a> Uart<'a> {
             tx_len: Cell::new(0),
             tx_status: Cell::new(UARTStateTX::Idle),
             rx_buffer: TakeCell::empty(),
+            rx_max_drain: Cell::new(0),
+            rx_overruns: Cell::new(0),
             rx_position: Cell::new(0),
             rx_len: Cell::new(0),
             rx_status: Cell::new(UARTStateRX::Idle),
@@ -515,6 +522,11 @@ impl<'a> Uart<'a> {
         {
             // Clear the receive-timeout interrupt (the level interrupt clears by draining).
             self.registers.uarticr.write(UARTICR::RTIC::SET);
+            if self.registers.uartrsr.is_set(UARTRSR::OE) {
+                self.rx_overruns.set(self.rx_overruns.get().wrapping_add(1));
+                self.registers.uartrsr.set(0); // any write clears the error flags
+            }
+            let mut drained: u32 = 0;
             // Drain everything the FIFO holds. Bytes beyond the current request stay in the
             // FIFO for the next receive_buffer(); if no receive is active they are dropped
             // (there is nobody to give them to), matching the previous single-byte behaviour.
@@ -525,6 +537,10 @@ impl<'a> Uart<'a> {
                 }
                 if self.rx_position.get() < self.rx_len.get() {
                     let byte = self.registers.uartdr.get() as u8;
+                    drained += 1;
+                    if drained > self.rx_max_drain.get() {
+                        self.rx_max_drain.set(drained);
+                    }
                     self.rx_buffer.map(|buf| {
                         buf[self.rx_position.get()] = byte;
                         self.rx_position.replace(self.rx_position.get() + 1);
@@ -561,6 +577,13 @@ impl Uart<'_> {
                 self.tx_position.replace(self.tx_position.get() + 1);
             });
         }
+    }
+
+    /// Diagnostics: (max bytes drained per interrupt, overrun count). Resets the max.
+    pub fn rx_stats(&self) -> (u32, u32) {
+        let m = self.rx_max_drain.get();
+        self.rx_max_drain.set(0);
+        (m, self.rx_overruns.get())
     }
 
     pub fn is_configured(&self) -> bool {
