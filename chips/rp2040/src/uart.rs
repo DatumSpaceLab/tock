@@ -454,6 +454,7 @@ impl<'a> Uart<'a> {
     }
 
     pub fn enable_transmit_interrupt(&self) {
+        self.registers.uartifls.modify(UARTIFLS::TXIFLSEL::FIFO_1_8);
         self.registers.uartimsc.modify(UARTIMSC::TXIM::SET);
     }
 
@@ -462,13 +463,18 @@ impl<'a> Uart<'a> {
     }
 
     pub fn enable_receive_interrupt(&self) {
+        // Interrupt when the RX FIFO holds >= 4 bytes, or when it goes idle with data
+        // (receive timeout) so short tails are delivered without waiting for the level.
         self.registers.uartifls.modify(UARTIFLS::RXIFLSEL::FIFO_1_8);
-
-        self.registers.uartimsc.modify(UARTIMSC::RXIM::SET);
+        self.registers
+            .uartimsc
+            .modify(UARTIMSC::RXIM::SET + UARTIMSC::RTIM::SET);
     }
 
     pub fn disable_receive_interrupt(&self) {
-        self.registers.uartimsc.modify(UARTIMSC::RXIM::CLEAR);
+        self.registers
+            .uartimsc
+            .modify(UARTIMSC::RXIM::CLEAR + UARTIMSC::RTIM::CLEAR);
     }
 
     fn uart_is_writable(&self) -> bool {
@@ -482,64 +488,70 @@ impl<'a> Uart<'a> {
 
     pub fn handle_interrupt(&self) {
         if self.registers.uartimsc.is_set(UARTIMSC::TXIM) {
-            if self.registers.uartfr.is_set(UARTFR::TXFE) {
-                if self.tx_status.get() == UARTStateTX::Idle {
-                    panic!("No data to transmit");
-                } else if self.tx_status.get() == UARTStateTX::Transmitting {
+            // With FIFOs enabled the TX interrupt asserts whenever the FIFO level is at or
+            // below the trigger, so top it up; once the whole buffer has been handed to the
+            // FIFO the transfer is complete from the client's point of view (the FIFO drains
+            // on its own). Completing here avoids a level-interrupt storm while the last
+            // trigger-level bytes shift out.
+            if self.tx_status.get() == UARTStateTX::Transmitting {
+                self.fill_fifo();
+                if self.tx_position.get() >= self.tx_len.get() {
                     self.disable_transmit_interrupt();
-                    if self.tx_position.get() < self.tx_len.get() {
-                        self.fill_fifo();
-                        self.enable_transmit_interrupt();
-                    }
-                    // Transmission is done
-                    else {
-                        self.tx_status.set(UARTStateTX::Idle);
-                        self.tx_client.map(|client| {
-                            self.tx_buffer.take().map(|buf| {
-                                client.transmitted_buffer(buf, self.tx_position.get(), Ok(()));
-                            });
+                    self.tx_status.set(UARTStateTX::Idle);
+                    self.tx_client.map(|client| {
+                        self.tx_buffer.take().map(|buf| {
+                            client.transmitted_buffer(buf, self.tx_position.get(), Ok(()));
                         });
-                    }
+                    });
                 }
+            } else {
+                // Spurious: nothing to send, make sure the interrupt cannot re-fire.
+                self.disable_transmit_interrupt();
             }
         }
 
-        if self.registers.uartimsc.is_set(UARTIMSC::RXIM) {
-            if self.registers.uartfr.is_set(UARTFR::RXFF) {
-                let byte = self.registers.uartdr.get() as u8;
-
-                self.disable_receive_interrupt();
-                if self.rx_status.get() == UARTStateRX::Receiving {
-                    if self.rx_position.get() < self.rx_len.get() {
-                        self.rx_buffer.map(|buf| {
-                            buf[self.rx_position.get()] = byte;
-                            self.rx_position.replace(self.rx_position.get() + 1);
-                        });
-                    }
-                    if self.rx_position.get() == self.rx_len.get() {
-                        // reception done
-                        self.rx_status.replace(UARTStateRX::Idle);
-                    } else {
-                        self.enable_receive_interrupt();
-                    }
-                    // notify client if transfer is done
-                    if self.rx_status.get() == UARTStateRX::Idle {
-                        self.rx_client.map(|client| {
-                            if let Some(buf) = self.rx_buffer.take() {
-                                client.received_buffer(
-                                    buf,
-                                    self.rx_len.get(),
-                                    Ok(()),
-                                    hil::uart::Error::None,
-                                );
-                            }
-                        });
-                    }
+        if self.registers.uartimsc.is_set(UARTIMSC::RXIM)
+            || self.registers.uartimsc.is_set(UARTIMSC::RTIM)
+        {
+            // Clear the receive-timeout interrupt (the level interrupt clears by draining).
+            self.registers.uarticr.write(UARTICR::RTIC::SET);
+            // Drain everything the FIFO holds. Bytes beyond the current request stay in the
+            // FIFO for the next receive_buffer(); if no receive is active they are dropped
+            // (there is nobody to give them to), matching the previous single-byte behaviour.
+            while !self.registers.uartfr.is_set(UARTFR::RXFE) {
+                if self.rx_status.get() != UARTStateRX::Receiving {
+                    let _ = self.registers.uartdr.get();
+                    continue;
+                }
+                if self.rx_position.get() < self.rx_len.get() {
+                    let byte = self.registers.uartdr.get() as u8;
+                    self.rx_buffer.map(|buf| {
+                        buf[self.rx_position.get()] = byte;
+                        self.rx_position.replace(self.rx_position.get() + 1);
+                    });
+                }
+                if self.rx_position.get() == self.rx_len.get() {
+                    // reception done: leave remaining bytes in the FIFO for the next request
+                    self.disable_receive_interrupt();
+                    self.rx_status.replace(UARTStateRX::Idle);
+                    self.rx_client.map(|client| {
+                        if let Some(buf) = self.rx_buffer.take() {
+                            client.received_buffer(
+                                buf,
+                                self.rx_len.get(),
+                                Ok(()),
+                                hil::uart::Error::None,
+                            );
+                        }
+                    });
+                    break;
                 }
             }
         }
     }
+}
 
+impl Uart<'_> {
     fn fill_fifo(&self) {
         while self.uart_is_writable() && self.tx_position.get() < self.tx_len.get() {
             self.tx_buffer.map(|buf| {
@@ -594,7 +606,9 @@ impl DeferredCallClient for Uart<'_> {
 impl Configure for Uart<'_> {
     fn configure(&self, params: Parameters) -> Result<(), ErrorCode> {
         self.disable();
-        self.registers.uartlcr_h.modify(UARTLCR_H::FEN::CLEAR);
+        // Enable the 32-entry TX/RX FIFOs. Without them the receive holding register is a single
+        // byte, so any kernel latency above one byte time (87 us at 115200) drops data.
+        self.registers.uartlcr_h.modify(UARTLCR_H::FEN::SET);
 
         let clk = self.clocks.map_or(125_000_000, |clocks| {
             clocks.get_frequency(clocks::Clock::Peripheral)
