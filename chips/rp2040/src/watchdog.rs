@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2022.
 
+use core::cell::Cell;
 use kernel::utilities::cells::OptionalCell;
-use kernel::utilities::registers::interfaces::{ReadWriteable, Writeable};
+use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, register_structs, ReadWrite};
 use kernel::utilities::StaticRef;
 
@@ -107,6 +108,8 @@ const WATCHDOG_BASE: StaticRef<WatchdogRegisters> =
 pub struct Watchdog<'a> {
     registers: StaticRef<WatchdogRegisters>,
     resets: OptionalCell<&'a resets::Resets>,
+    /// Reload value for the hardware watchdog timer (see `set_period_us`); 0 = kernel watchdog disabled.
+    load: Cell<u32>,
 }
 
 impl<'a> Watchdog<'a> {
@@ -114,7 +117,27 @@ impl<'a> Watchdog<'a> {
         Watchdog {
             registers: WATCHDOG_BASE,
             resets: OptionalCell::empty(),
+            load: Cell::new(0),
         }
+    }
+
+    /// Configure the period of the kernel watchdog (`kernel::platform::watchdog::WatchDog`).
+    /// The RP2040 watchdog counts `clk_tick` (1 MHz with `start_tick(12)` on a 12 MHz XOSC) and, per
+    /// RP2040 erratum RP2040-E1, decrements twice per tick, so the LOAD value is 2 x the period in
+    /// microseconds; the 24-bit field caps the period at ~8.3 s. Must be called before the kernel
+    /// starts (`setup()` is invoked by the kernel main loop). 0 leaves the watchdog disabled.
+    pub fn set_period_us(&self, period_us: u32) {
+        self.load.set((period_us.saturating_mul(2)).min(0xFF_FFFF));
+    }
+
+    /// True when the last reset was caused by the watchdog timer expiring (not a forced trigger).
+    pub fn reset_by_timer(&self) -> bool {
+        self.registers.reason.is_set(REASON::TIMER)
+    }
+
+    /// True when the last reset was a forced watchdog trigger (`reboot()`).
+    pub fn reset_forced(&self) -> bool {
+        self.registers.reason.is_set(REASON::FORCE)
     }
 
     pub fn resolve_dependencies(&self, resets: &'a resets::Resets) {
@@ -131,5 +154,46 @@ impl<'a> Watchdog<'a> {
         self.resets
             .map(|resets| resets.watchdog_reset_all_except(&[]));
         self.registers.ctrl.write(CTRL::TRIGGER::SET);
+    }
+}
+
+/// Kernel watchdog: the kernel main loop calls `tickle()` on every scheduler iteration and
+/// `suspend()`/`resume()` around sleeping. A hung kernel stops tickling and the chip resets
+/// (all GPIO/PWM return to their reset state = outputs low).
+impl kernel::platform::watchdog::WatchDog for Watchdog<'_> {
+    fn setup(&self) {
+        let load = self.load.get();
+        if load == 0 {
+            return;
+        }
+        // Pause while a debugger halts the core, so single-stepping does not reset the chip.
+        self.registers.load.set(load);
+        self.registers.ctrl.modify(
+            CTRL::PAUSE_DBG0::SET
+                + CTRL::PAUSE_DBG1::SET
+                + CTRL::PAUSE_JTAG::SET
+                + CTRL::ENABLE::SET,
+        );
+    }
+
+    fn tickle(&self) {
+        let load = self.load.get();
+        if load != 0 {
+            self.registers.load.set(load);
+        }
+    }
+
+    fn suspend(&self) {
+        if self.load.get() != 0 {
+            self.registers.ctrl.modify(CTRL::ENABLE::CLEAR);
+        }
+    }
+
+    fn resume(&self) {
+        let load = self.load.get();
+        if load != 0 {
+            self.registers.load.set(load);
+            self.registers.ctrl.modify(CTRL::ENABLE::SET);
+        }
     }
 }
