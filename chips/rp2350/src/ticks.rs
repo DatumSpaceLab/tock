@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright OxidOS Automotive 2025.
 
-use kernel::utilities::registers::interfaces::{ReadWriteable, Readable};
+use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite};
 use kernel::utilities::StaticRef;
 
@@ -166,6 +166,18 @@ impl Ticks {
             .timer1_cycles
             .modify(TIMER1_CYCLES::TIMER1_CYCLES.val(12));
         self.registers.timer1_ctrl.modify(TIMER1_CTRL::ENABLE::SET);
+    }
+
+    /// 1 MHz tick for the watchdog (12 cycles of the 12 MHz XOSC), the RP2350 counterpart of the
+    /// RP2040 `WATCHDOG.TICK` register.
+    pub fn set_watchdog_generator(&self) {
+        self.registers
+            .watchdog_ctrl
+            .modify(WATCHDOG_CTRL::ENABLE::CLEAR);
+        self.registers.watchdog_cycles.set(12);
+        self.registers
+            .watchdog_ctrl
+            .modify(WATCHDOG_CTRL::ENABLE::SET);
     }
 
     pub fn is_timer0_on(&self) -> bool {

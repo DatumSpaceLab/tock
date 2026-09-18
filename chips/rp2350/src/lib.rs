@@ -7,14 +7,18 @@
 // and requires a deeper recursion limit than the default to fully expand.
 #![recursion_limit = "256"]
 
+pub mod adc;
 pub mod chip;
 pub mod clocks;
 pub mod gpio;
+pub mod i2c;
 pub mod interrupts;
+pub mod pwm;
 pub mod resets;
 pub mod ticks;
 pub mod timer;
 pub mod uart;
+pub mod watchdog;
 pub mod xosc;
 
 use cortexm33::{initialize_ram_jump_to_main, unhandled_interrupt, CortexM33, CortexMVariant};

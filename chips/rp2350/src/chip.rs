@@ -106,8 +106,12 @@ impl<I: InterruptService> Chip for Rp2350<'_, I> {
 }
 
 pub struct Rp2350DefaultPeripherals<'a> {
+    pub adc: crate::adc::Adc<'a>,
     pub clocks: Clocks,
+    pub i2c0: crate::i2c::I2c<'a, 'a>,
+    pub watchdog: crate::watchdog::Watchdog<'a>,
     pub pins: RPPins<'a>,
+    pub pwm: crate::pwm::Pwm<'a>,
     pub resets: Resets,
     pub sio: SIO,
     pub ticks: Ticks,
@@ -120,8 +124,12 @@ pub struct Rp2350DefaultPeripherals<'a> {
 impl Rp2350DefaultPeripherals<'_> {
     pub fn new() -> Self {
         Self {
+            adc: crate::adc::Adc::new(),
             clocks: Clocks::new(),
+            i2c0: crate::i2c::I2c::new_i2c0(),
+            watchdog: crate::watchdog::Watchdog::new(),
             pins: RPPins::new(),
+            pwm: crate::pwm::Pwm::new(),
             resets: Resets::new(),
             sio: SIO::new(),
             ticks: Ticks::new(),
@@ -134,6 +142,11 @@ impl Rp2350DefaultPeripherals<'_> {
 
     pub fn resolve_dependencies(&'static self) {
         self.uart0.set_clocks(&self.clocks);
+        self.uart1.set_clocks(&self.clocks);
+        self.pwm.set_clocks(&self.clocks);
+        self.watchdog.resolve_dependencies(&self.resets);
+        self.i2c0.resolve_dependencies(&self.clocks, &self.resets);
+        self.ticks.set_watchdog_generator();
         self.ticks.set_timer0_generator();
         self.ticks.set_timer1_generator();
         kernel::deferred_call::DeferredCallClient::register(&self.uart0);
@@ -154,6 +167,22 @@ impl InterruptService for Rp2350DefaultPeripherals<'_> {
             }
             interrupts::UART0_IRQ => {
                 self.uart0.handle_interrupt();
+                true
+            }
+            interrupts::UART1_IRQ => {
+                self.uart1.handle_interrupt();
+                true
+            }
+            interrupts::ADC_IRQ_FIFO => {
+                self.adc.handle_interrupt();
+                true
+            }
+            interrupts::I2C0_IRQ => {
+                self.i2c0.handle_interrupt();
+                true
+            }
+            interrupts::PWM_IRQ_WRAP_0 => {
+                // The PWM HIL has no interrupt support; wrap interrupts are ignored (as on rp2040).
                 true
             }
             _ => false,

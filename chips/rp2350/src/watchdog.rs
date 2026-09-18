@@ -1,0 +1,182 @@
+// Licensed under the Apache License, Version 2.0 or the MIT License.
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright Tock Contributors 2022.
+// RP2350 port (DatumSpace K.K., 2026): register map identical to RP2040 minus the TICK register.
+
+use core::cell::Cell;
+use kernel::utilities::cells::OptionalCell;
+use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
+use kernel::utilities::registers::{register_bitfields, register_structs, ReadWrite};
+use kernel::utilities::StaticRef;
+
+use crate::resets;
+
+register_structs! {
+
+    WatchdogRegisters {
+        /// Watchdog control
+        /// The rst_wdsel register determines which subsystems are reset when th
+        /// The watchdog can be triggered in software.
+        (0x000 => ctrl: ReadWrite<u32, CTRL::Register>),
+        /// Load the watchdog timer. The maximum setting is 0xffffff which corresponds to 0x
+        (0x004 => load: ReadWrite<u32>),
+        /// Logs the reason for the last reset. Both bits are zero for the case of a hardwar
+        (0x008 => reason: ReadWrite<u32, REASON::Register>),
+        /// Scratch register. Information persists through soft reset of the chip.
+        (0x00C => scratch0: ReadWrite<u32, SCRATCH0::Register>),
+        /// Scratch register. Information persists through soft reset of the chip.
+        (0x010 => scratch1: ReadWrite<u32, SCRATCH1::Register>),
+        /// Scratch register. Information persists through soft reset of the chip.
+        (0x014 => scratch2: ReadWrite<u32, SCRATCH2::Register>),
+        /// Scratch register. Information persists through soft reset of the chip.
+        (0x018 => scratch3: ReadWrite<u32, SCRATCH3::Register>),
+        /// Scratch register. Information persists through soft reset of the chip.
+        (0x01C => scratch4: ReadWrite<u32, SCRATCH4::Register>),
+        /// Scratch register. Information persists through soft reset of the chip.
+        (0x020 => scratch5: ReadWrite<u32, SCRATCH5::Register>),
+        /// Scratch register. Information persists through soft reset of the chip.
+        (0x024 => scratch6: ReadWrite<u32, SCRATCH6::Register>),
+        /// Scratch register. Information persists through soft reset of the chip.
+        (0x028 => scratch7: ReadWrite<u32, SCRATCH7::Register>),
+        (0x02C => @END),
+    }
+}
+register_bitfields![u32,
+    CTRL [
+        /// Trigger a watchdog reset
+        TRIGGER OFFSET(31) NUMBITS(1) [],
+        /// When not enabled the watchdog timer is paused
+        ENABLE OFFSET(30) NUMBITS(1) [],
+        /// Pause the watchdog timer when processor 1 is in debug mode
+        PAUSE_DBG1 OFFSET(26) NUMBITS(1) [],
+        /// Pause the watchdog timer when processor 0 is in debug mode
+        PAUSE_DBG0 OFFSET(25) NUMBITS(1) [],
+        /// Pause the watchdog timer when JTAG is accessing the bus fabric
+        PAUSE_JTAG OFFSET(24) NUMBITS(1) [],
+        /// Indicates the number of ticks / 2 (see errata RP2040-E1) before a watchdog reset
+        TIME OFFSET(0) NUMBITS(24) []
+    ],
+    LOAD [
+
+        LOAD OFFSET(0) NUMBITS(24) []
+    ],
+    REASON [
+
+        FORCE OFFSET(1) NUMBITS(1) [],
+
+        TIMER OFFSET(0) NUMBITS(1) []
+    ],
+    SCRATCH0 [
+        VALUE OFFSET (0) NUMBITS (32) []
+    ],
+    SCRATCH1 [
+        VALUE OFFSET (0) NUMBITS (32) []
+    ],
+    SCRATCH2 [
+        VALUE OFFSET (0) NUMBITS (32) []
+    ],
+    SCRATCH3 [
+        VALUE OFFSET (0) NUMBITS (32) []
+    ],
+    SCRATCH4 [
+        VALUE OFFSET (0) NUMBITS (32) []
+    ],
+    SCRATCH5 [
+        VALUE OFFSET (0) NUMBITS (32) []
+    ],
+    SCRATCH6 [
+        VALUE OFFSET (0) NUMBITS (32) []
+    ],
+    SCRATCH7 [
+        VALUE OFFSET (0) NUMBITS (32) []
+    ],
+];
+const WATCHDOG_BASE: StaticRef<WatchdogRegisters> =
+    unsafe { StaticRef::new(0x400D8000 as *const WatchdogRegisters) };
+
+pub struct Watchdog<'a> {
+    registers: StaticRef<WatchdogRegisters>,
+    resets: OptionalCell<&'a resets::Resets>,
+    /// Reload value for the hardware watchdog timer (see `set_period_us`); 0 = kernel watchdog disabled.
+    load: Cell<u32>,
+}
+
+impl<'a> Watchdog<'a> {
+    pub const fn new() -> Watchdog<'a> {
+        Watchdog {
+            registers: WATCHDOG_BASE,
+            resets: OptionalCell::empty(),
+            load: Cell::new(0),
+        }
+    }
+
+    /// Configure the period of the kernel watchdog (`kernel::platform::watchdog::WatchDog`).
+    /// The RP2350 watchdog counts the 1 MHz tick from the TICKS block (`Ticks::set_watchdog_generator`,
+    /// 12 cycles of the 12 MHz XOSC) once per tick (the RP2040-E1 double-decrement does not apply), so
+    /// LOAD is the period in microseconds; the 24-bit field caps it at ~16.7 s. Must be called before the
+    /// kernel starts (`setup()` is invoked by the kernel main loop). 0 leaves the watchdog disabled.
+    pub fn set_period_us(&self, period_us: u32) {
+        self.load.set(period_us.min(0xFF_FFFF));
+    }
+
+    /// True when the last reset was caused by the watchdog timer expiring (not a forced trigger).
+    pub fn reset_by_timer(&self) -> bool {
+        self.registers.reason.is_set(REASON::TIMER)
+    }
+
+    /// True when the last reset was a forced watchdog trigger (`reboot()`).
+    pub fn reset_forced(&self) -> bool {
+        self.registers.reason.is_set(REASON::FORCE)
+    }
+
+    pub fn resolve_dependencies(&self, resets: &'a resets::Resets) {
+        self.resets.set(resets);
+    }
+
+    pub fn reboot(&self) {
+        self.resets
+            .map(|resets| resets.watchdog_reset_all_except(&[]));
+        self.registers.ctrl.write(CTRL::TRIGGER::SET);
+    }
+}
+
+/// Kernel watchdog: the kernel main loop calls `tickle()` on every scheduler iteration and
+/// `suspend()`/`resume()` around sleeping. A hung kernel stops tickling and the chip resets
+/// (all GPIO/PWM return to their reset state = outputs low).
+impl kernel::platform::watchdog::WatchDog for Watchdog<'_> {
+    fn setup(&self) {
+        let load = self.load.get();
+        if load == 0 {
+            return;
+        }
+        // Pause while a debugger halts the core, so single-stepping does not reset the chip.
+        self.registers.load.set(load);
+        self.registers.ctrl.modify(
+            CTRL::PAUSE_DBG0::SET
+                + CTRL::PAUSE_DBG1::SET
+                + CTRL::PAUSE_JTAG::SET
+                + CTRL::ENABLE::SET,
+        );
+    }
+
+    fn tickle(&self) {
+        let load = self.load.get();
+        if load != 0 {
+            self.registers.load.set(load);
+        }
+    }
+
+    fn suspend(&self) {
+        if self.load.get() != 0 {
+            self.registers.ctrl.modify(CTRL::ENABLE::CLEAR);
+        }
+    }
+
+    fn resume(&self) {
+        let load = self.load.get();
+        if load != 0 {
+            self.registers.load.set(load);
+            self.registers.ctrl.modify(CTRL::ENABLE::SET);
+        }
+    }
+}
